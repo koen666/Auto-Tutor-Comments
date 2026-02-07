@@ -1,0 +1,5 @@
+{
+  "name": "Auto-Tutor Comments",
+  "description": "An iOS-styled web application to automate student assessment comments using Gemini AI.",
+  "requestFramePermissions": []
+}
