@@ -35,39 +35,64 @@ export const DataTable: React.FC = () => {
     if (!isPaused) setProgress(0);
 
     const total = data.length;
-    // Process in batches of 3 to avoid rate limits
-    const BATCH_SIZE = 3;
-    
-    for (let i = startIndex; i < total; i += BATCH_SIZE) {
-       // Check if stopped/paused externally
-       // We use useStore.getState() to check the *fresh* value inside the loop
-       const currentState = useStore.getState();
-       if (!currentState.isGenerating) {
-         // Loop was stopped. If isPaused is set, we just exit, state is preserved.
-         return;
-       }
+    // Concurrency pool: keep N requests in-flight at all times for steady throughput
+    const CONCURRENCY = 5; // 5 parallel requests - Qwen has generous rate limits
+    const STAGGER_MS = 200; // minimal stagger
+    let completed = 0;
+    const rowsToProcess = data.slice(startIndex);
 
-       const batch = data.slice(i, i + BATCH_SIZE);
-       const promises = batch.map(async (row, batchIndex) => {
-          const actualIndex = i + batchIndex;
-          const comment = await generateComment(row, targetColumn);
-          updateRow(actualIndex, targetColumn, comment);
-       });
-       
-       await Promise.all(promises);
-       
-       const nextIndex = i + BATCH_SIZE;
-       const currentProgress = Math.min(100, Math.round((nextIndex / total) * 100));
-       
-       // Update Store
-       setCurrentIndex(nextIndex);
-       setProgress(currentProgress);
+    // Simple concurrency limiter
+    let running = 0;
+    let idx = 0;
 
-       // Rate Limit Protection: Add a small delay between batches
-       if (i + BATCH_SIZE < total) {
-         await new Promise(resolve => setTimeout(resolve, 1500)); 
-       }
-    }
+    const processRow = async (row: typeof data[0], actualIndex: number) => {
+      const currentState = useStore.getState();
+      if (!currentState.isGenerating) return;
+
+      const comment = await generateComment(row, targetColumn);
+
+      const freshState = useStore.getState();
+      if (!freshState.isGenerating && !freshState.isPaused) return;
+
+      updateRow(actualIndex, targetColumn, comment);
+      completed++;
+      const currentProgress = Math.min(100, Math.round(((startIndex + completed) / total) * 100));
+      setCurrentIndex(startIndex + completed);
+      setProgress(currentProgress);
+    };
+
+    await new Promise<void>((resolve) => {
+      const tryNext = () => {
+        while (running < CONCURRENCY && idx < rowsToProcess.length) {
+          const currentState = useStore.getState();
+          if (!currentState.isGenerating) { 
+            if (running === 0) resolve();
+            return;
+          }
+
+          const i = idx++;
+          const actualIndex = startIndex + i;
+          running++;
+
+          // Stagger: delay the 2nd+ concurrent request slightly
+          const stagger = (running > 1) ? STAGGER_MS * (running - 1) : 0;
+          setTimeout(() => {
+            processRow(rowsToProcess[i], actualIndex).finally(() => {
+              running--;
+              if (idx >= rowsToProcess.length && running === 0) {
+                resolve();
+              } else {
+                tryNext();
+              }
+            });
+          }, stagger);
+        }
+        if (idx >= rowsToProcess.length && running === 0) {
+          resolve();
+        }
+      };
+      tryNext();
+    });
 
     // Finished
     setIsGenerating(false);
