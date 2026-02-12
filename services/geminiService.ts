@@ -2,7 +2,7 @@
 
 const QWEN_API_KEY = process.env.QWEN_API_KEY || "";
 const QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
-const QWEN_MODEL = "qwen-turbo-latest";
+const QWEN_MODEL = "qwen-max-latest";
 
 const SYSTEM_INSTRUCTION = `你是一位高中数学/物理老师，熟悉一线课堂与考试要求，正在为学生和家长撰写简洁、专业、可操作的学习评语。
 
@@ -12,6 +12,8 @@ const SYSTEM_INSTRUCTION = `你是一位高中数学/物理老师，熟悉一线
 3. **具体+走心**：不要空洞的鼓励，要结合'{TARGET_COLUMN}'列的薄弱点关键词给出可操作的学习建议（描述学生后续怎么做，面向家长可理解）
 4. **因人而异**：根据分数段调整语气，但要自然变化，避免模板化
 5. **术语贴合学科**：根据科目自动切换表述（数学偏概念/方法/题型，物理偏模型/过程/实验/受力）
+6. **草稿关键词先“老师化”再落笔**：薄弱点关键词可能是老师/家长随手写的草稿（口语、冗长、甚至不规范），写评语时必须先转成课堂常用说法再使用；避免原样照抄生硬长词。
+7. **反套话**：尽量避免固定句式（如“虽是…但…/下一步可尝试/稳步提升…”等），用更像真实老师的表达。
 
 ## 任务流程
 1. 识别：学生姓名、成绩、科目、'{TARGET_COLUMN}'列的薄弱点关键词、最近课堂内容
@@ -32,6 +34,7 @@ const SYSTEM_INSTRUCTION = `你是一位高中数学/物理老师，熟悉一线
 - **防模板化**：避免固定句式开头，开头/中间/结尾至少各更换一种表述方式
 - **不要表情符号**，不使用emoji或颜文字
 - **不建议家长做什么**，建议只描述学生后续行动
+- 当薄弱点来自草稿词时，优先用短、准、课堂化的关键词（8-14字左右），不要把草稿整句塞进评语。
 
 ---
 
@@ -54,6 +57,72 @@ const BASE_DELAY_MS = 500;
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+const pickFirstString = (row: StudentRow, keys: string[]) => {
+  for (const key of keys) {
+    const value = row?.[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+};
+
+const guessStudentName = (row: StudentRow) =>
+  pickFirstString(row, ["姓名", "Name", "name", "学生姓名", "学生", "同学"]) || "同学";
+
+const guessLesson = (row: StudentRow) =>
+  pickFirstString(row, ["课堂内容", "最近课堂内容", "Lesson", "lesson", "本周内容", "教学内容"]);
+
+const inferSubjectFromTarget = (targetColumn: string) => {
+  const col = (targetColumn || "").toLowerCase();
+  if (col.includes("物理") || col.includes("physics")) return "物理";
+  if (col.includes("数学") || col.includes("math")) return "数学";
+  return "";
+};
+
+const teacherizeWeaknessDraft = (draft: unknown, subjectHint: string) => {
+  if (draft == null) return "";
+  const raw = String(draft).trim();
+  if (!raw) return "";
+
+  // Remove obvious draft suffixes and punctuation clutter
+  let text = raw
+    .replace(/[“”"']/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/(方面|问题|题目|题型)\s*$/g, "")
+    .trim();
+
+  // Common classroom-friendly rewrites
+  text = text
+    .replace(/找规律/g, "模型归纳")
+    .replace(/滑块\s*木板/g, "滑块-木板")
+    .replace(/滑块\s*\-\s*木板\s*模型/g, "滑块-木板相对运动模型")
+    .replace(/滑块-木板模型/g, "滑块-木板相对运动模型")
+    .replace(/模型归纳问题/g, "模型归纳")
+    .replace(/受力分析整体法/g, "整体法受力分析")
+    .replace(/受力分析隔离法/g, "隔离法受力分析")
+    .replace(/最大最小值问题/g, "函数最值")
+    .replace(/函数的最大最小值/g, "函数最值")
+    .replace(/切线性质/g, "切线条件")
+    .trim();
+
+  // If still too long, compress by keeping core tokens
+  if (text.length > 18) {
+    text = text
+      .replace(/(的|与|以及|并且|同时|虽然|但是|下一步|尝试|形成|提升|稳步)/g, "")
+      .replace(/\s+/g, "")
+      .trim();
+  }
+
+  // Add light subject-specific hint if missing (avoid adding new concepts)
+  if (subjectHint === "物理" && text.includes("滑块-木板") && !text.includes("相对运动")) {
+    text = text.replace("滑块-木板", "滑块-木板相对运动");
+  }
+  if (subjectHint === "数学" && text.includes("函数") && !text.includes("最值") && raw.includes("最大") && raw.includes("最小")) {
+    text = text.replace(/函数/g, "函数最值");
+  }
+
+  return text;
+};
+
 export const generateComment = async (
   row: StudentRow,
   targetColumn: string
@@ -62,7 +131,28 @@ export const generateComment = async (
     return "Error: Missing QWEN_API_KEY. Set it in .env.local.";
   }
   const specificSystemInstruction = SYSTEM_INSTRUCTION.replace(/{TARGET_COLUMN}/g, targetColumn);
-  const prompt = `Row Data: ${JSON.stringify(row)}\nTarget Column Name: ${targetColumn}`;
+
+  const subjectHint = inferSubjectFromTarget(targetColumn);
+  const studentName = guessStudentName(row);
+  const lesson = guessLesson(row);
+  const weaknessDraft = row?.[targetColumn];
+  const weaknessPolished = teacherizeWeaknessDraft(weaknessDraft, subjectHint);
+
+  const promptPayload = {
+    studentName,
+    subjectHint,
+    targetColumn,
+    weaknessDraft,
+    weaknessPolished,
+    lesson,
+    row
+  };
+
+  const prompt = [
+    "请基于以下数据写评语：",
+    JSON.stringify(promptPayload),
+    "要求：优先使用 weaknessPolished 的课堂化表述；不要原样照抄 weaknessDraft 里的长句草稿。"
+  ].join("\n");
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
@@ -78,7 +168,7 @@ export const generateComment = async (
             { role: "system", content: specificSystemInstruction },
             { role: "user", content: prompt },
           ],
-          temperature: 0.9,
+          temperature: 0.85,
           max_tokens: 300,
         }),
       });
